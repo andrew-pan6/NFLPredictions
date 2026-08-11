@@ -23,8 +23,36 @@ def load_data():
     return schedules, pbp
 
 
+def normalize_team_names(df):
+    return df.with_columns(
+        pl.col("team").replace({
+            "STL": "LA",
+            "SD": "LAC",
+            "OAK": "LV",
+            "WAS": "WAS"
+        }).alias("team")
+    )
+
+
+def normalize_schedule_team_names(games):
+    return games.with_columns([
+        pl.col("away_team").replace({
+            "STL": "LA",
+            "SD": "LAC",
+            "OAK": "LV",
+            "WAS": "WAS"
+        }).alias("away_team"),
+        pl.col("home_team").replace({
+            "STL": "LA",
+            "SD": "LAC",
+            "OAK": "LV",
+            "WAS": "WAS"
+        }).alias("home_team")
+    ])
+
+
 def build_games(schedules):
-    games = (schedules.filter(
+    games = schedules.filter(
         pl.col("game_type") == "REG"
     ).select([
         "game_id", "season", "week", "gameday", "away_team", "home_team",
@@ -33,13 +61,15 @@ def build_games(schedules):
         pl.col("gameday").str.to_date(),
         (pl.col("home_score") > pl.col("away_score")).cast(pl.Int8).alias("home_win"),
         (pl.col("home_score") - pl.col("away_score")).alias("point_margin")
-    ]))
+    ])
+
+    games = normalize_schedule_team_names(games)
 
     return games
 
 
 def build_play_stats(pbp):
-    plays = (pbp.filter(
+    plays = pbp.filter(
         (pl.col("season_type") == "REG") &
         pl.col("posteam").is_not_null() &
         pl.col("defteam").is_not_null() &
@@ -51,7 +81,20 @@ def build_play_stats(pbp):
         (pl.col("play_deleted").fill_null(0) != 1)
     ).select([
         "game_id", "season", "week", "posteam", "defteam", "epa"
-    ]))
+    ]).with_columns([
+        pl.col("posteam").replace({
+            "STL": "LA",
+            "SD": "LAC",
+            "OAK": "LV",
+            "WAS": "WAS"
+        }).alias("posteam"),
+        pl.col("defteam").replace({
+            "STL": "LA",
+            "SD": "LAC",
+            "OAK": "LV",
+            "WAS": "WAS"
+        }).alias("defteam")
+    ])
 
     offensive = plays.group_by([
         "game_id", "season", "week", "posteam"
@@ -107,8 +150,8 @@ def build_team_games(games, team_stats):
 
     team_games = team_games.join(
         team_stats,
-        on = ["game_id", "season", "week", "team"],
-        how = "left"
+        on=["game_id", "season", "week", "team"],
+        how="left"
     )
 
     team_games = team_games.with_columns(
@@ -121,10 +164,10 @@ def build_team_games(games, team_stats):
 def check_team_game_joins(games, pbp, team_stats, team_games):
     print("\nChecking raw PBP for missing games:")
 
-    game_ids = team_stats.get_column("game_id").unique()
-
-    missing_games = games.filter(
-        ~pl.col("game_id").is_in(game_ids)
+    missing_games = games.join(
+        team_stats.select("game_id").unique(),
+        on = "game_id",
+        how = "anti"
     )
 
     print(missing_games.select([
@@ -147,17 +190,26 @@ def check_team_game_joins(games, pbp, team_stats, team_games):
             ])
         )
 
-    print("\nChecking OAK, SD, and STL raw PBP:")
+    print("\nChecking historical team identifiers:")
 
     print(
-        pbp.filter(
-            pl.col("posteam").is_in(["OAK", "SD", "STL"]) |
-            pl.col("defteam").is_in(["OAK", "SD", "STL"])
+        games.select([
+            pl.col("away_team").alias("team"),
+            "season"
+        ]).vstack(
+            games.select([
+                pl.col("home_team").alias("team"),
+                "season"
+            ])
+        ).filter(
+            pl.col("team").is_in(["LA", "LAC", "LV", "WAS"])
         ).group_by([
-            "season", "posteam", "defteam"
+            "season", "team"
         ]).agg(
-            pl.len().alias("plays")
-        ).sort("season")
+            pl.len().alias("games")
+        ).sort([
+            "season", "team"
+        ])
     )
 
     print("\nChecking team-game joins")
@@ -179,7 +231,7 @@ def check_team_game_joins(games, pbp, team_stats, team_games):
     print(
         missing_stats.group_by("team")
         .agg(pl.len().alias("missing"))
-        .sort("missing", descending = True)
+        .sort("missing", descending=True)
     )
 
     print("\nExample missing play stats:")
@@ -197,8 +249,11 @@ def check_team_game_joins(games, pbp, team_stats, team_games):
     print(f"Games: {len(game_ids):,}")
     print(f"Team-stat game IDs: {len(team_stat_game_ids):,}")
 
-    missing_game_stats = games.filter(
-        ~pl.col("game_id").is_in(team_stat_game_ids)
+    # Changed from is_in() to an anti join to avoid the Polars warning.
+    missing_game_stats = games.join(
+        team_stats.select("game_id").unique(),
+        on="game_id",
+        how="anti"
     )
 
     print("\nGames missing from team stats:")
@@ -214,9 +269,7 @@ def check_team_game_joins(games, pbp, team_stats, team_games):
         "game_id", "team"
     ]).unique()
 
-    actual_team_keys = team_stats.select([
-        "game_id", "team"
-    ]).unique()
+    actual_team_keys = team_stats.select(["game_id", "team"]).unique()
 
     missing_team_keys = expected_team_keys.join(
         actual_team_keys,
@@ -232,17 +285,34 @@ def add_pregame_features(team_games):
     team_games = team_games.sort(["team", "gameday"])
 
     team_games = team_games.with_columns([
-        pl.col("off_epa_total").shift(1).cum_sum().over("team").alias("previous_off_epa_total"),
-        pl.col("def_epa_allowed_total").shift(1).cum_sum().over("team").alias("previous_def_epa_total"),
-        pl.col("off_plays").shift(1).cum_sum().over("team").alias("previous_plays"),
-        pl.col("def_plays").shift(1).cum_sum().over("team").alias("previous_def_plays"),
-        pl.col("game_id").shift(1).cum_count().over("team").alias("previous_games")
+        pl.col("off_epa_total").fill_null(0).shift(1).cum_sum().over("team").alias("previous_off_epa_total"),
+        pl.col("def_epa_allowed_total").fill_null(0).shift(1).cum_sum().over("team").alias("previous_def_epa_total"),
+        pl.col("off_plays").fill_null(0).shift(1).cum_sum().over("team").alias("previous_plays"),
+        pl.col("def_plays").fill_null(0).shift(1).cum_sum().over("team").alias("previous_def_plays"),
+        pl.col("off_plays").is_not_null().cast(pl.Int8).shift(1).cum_sum().over("team").alias("previous_games")
     ])
 
     team_games = team_games.with_columns([
-        (pl.col("previous_off_epa_total") / pl.col("previous_plays")).alias("pregame_off_epa"),
-        (pl.col("previous_def_epa_total") / pl.col("previous_def_plays")).alias("pregame_def_epa"),
-        (pl.col("previous_plays") / pl.col("previous_games")).alias("pregame_pace")
+        pl.when(pl.col("previous_plays") > 0)
+        .then(
+            pl.col("previous_off_epa_total") / pl.col("previous_plays")
+        )
+        .otherwise(None)
+        .alias("pregame_off_epa"),
+
+        pl.when(pl.col("previous_def_plays") > 0)
+        .then(
+            pl.col("previous_def_epa_total") / pl.col("previous_def_plays")
+        )
+        .otherwise(None)
+        .alias("pregame_def_epa"),
+
+        pl.when(pl.col("previous_games") > 0)
+        .then(
+            pl.col("previous_plays") / pl.col("previous_games")
+        )
+        .otherwise(None)
+        .alias("pregame_pace")
     ])
 
     return team_games
@@ -262,12 +332,10 @@ def check_pregame_features(team_games):
         ]).head(20)
     )
 
-    missing = team_games.filter(
-        pl.col("pregame_off_epa").is_null()
-    )
+    missing = team_games.filter(pl.col("pregame_off_epa").is_null())
 
     missing_with_reason = missing.with_columns(
-        pl.when(pl.col("previous_games").is_null())
+        pl.when(pl.col("previous_games").fill_null(0) == 0)
         .then(pl.lit("no_previous_history"))
         .otherwise(pl.lit("missing_play_stats"))
         .alias("missing_reason")
@@ -277,14 +345,14 @@ def check_pregame_features(team_games):
     print(
         missing_with_reason.group_by("missing_reason")
         .agg(pl.len().alias("count"))
-        .sort("count", descending = True)
+        .sort("count", descending=True)
     )
 
     print("\nMissing pregame features by team:")
     print(
         missing.group_by("team")
         .agg(pl.len().alias("missing"))
-        .sort("missing", descending = True)
+        .sort("missing", descending=True)
     )
 
     print(f"Team-games without pregame history: {len(missing):,}")
@@ -348,12 +416,13 @@ def main():
         .sort("season")
     )
 
-    check_team_game_joins(games, pbp, team_stats, build_team_games(games, team_stats))
-
     print("\nBuilding team-game dataset")
     team_games = build_team_games(games, team_stats)
 
+    check_team_game_joins(games, pbp, team_stats, team_games)
+
     print("\nCalculating pregame features")
+    team_games = team_games.filter(pl.col("off_epa").is_not_null())
     team_games = add_pregame_features(team_games)
 
     check_pregame_features(team_games)
@@ -367,9 +436,7 @@ def main():
     )
 
     print(
-        missing_stats.select([
-            "season", "week", "game_id", "team", "opponent"
-        ]).head(20)
+        missing_stats.select(["season", "week", "game_id", "team", "opponent"]).head(20)
     )
 
     print(f"Team-games missing play stats: {len(missing_stats):,}")
