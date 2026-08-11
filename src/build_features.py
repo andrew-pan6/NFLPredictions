@@ -1,3 +1,4 @@
+import argparse
 import nflreadpy as nfl
 import polars as pl
 from pathlib import Path
@@ -8,7 +9,23 @@ END_SEASON = 2025
 OUTPUT_PATH = Path("data/processed/team_game_features.parquet")
 
 
+def parse_args():
+    """
+    --debug (or -d) turns on the diagnostic prints
+    """
+    parser = argparse.ArgumentParser(description = "Build NFL team-game feature dataset")
+    parser.add_argument(
+        "--debug", "-d",
+        action = "store_true",
+        help = "Run extra diagnostic checks (missing joins, duplicates, etc.)"
+    )
+
+    return parser.parse_args()
+
 def load_data():
+    """
+    Pull raw schedules and play-by-play data for the configured season range
+    """
     seasons = list(range(START_SEASON, END_SEASON + 1))
 
     print(f"Loading schedules from {START_SEASON} - {END_SEASON}")
@@ -23,24 +40,16 @@ def load_data():
     return schedules, pbp
 
 
-def normalize_team_names(df):
-    return df.with_columns(
-        pl.col("team").replace({
-            "STL": "LA",
-            "SD": "LAC",
-            "OAK": "LV",
-            "WAS": "WAS"
-        }).alias("team")
-    )
-
-
 def normalize_schedule_team_names(games):
+    """
+    Relabel relocated franchiese to their current team codes    
+    """
     return games.with_columns([
         pl.col("away_team").replace({
-            "STL": "LA",
-            "SD": "LAC",
-            "OAK": "LV",
-            "WAS": "WAS"
+            "STL": "LA",    # Rams: St. Louis -> LA
+            "SD": "LAC",    # Chargers: San Diego -> LA
+            "OAK": "LV",    # Raiders: Oakland -> LV
+            "WAS": "WAS"    # Commanders: Renamed
         }).alias("away_team"),
         pl.col("home_team").replace({
             "STL": "LA",
@@ -52,6 +61,11 @@ def normalize_schedule_team_names(games):
 
 
 def build_games(schedules):
+    """
+    Filter to regular-season games and derive the target/label columns
+
+    home_win: 1 if home team won, else 0 (ties are not handled)
+    """
     games = schedules.filter(
         pl.col("game_type") == "REG"
     ).select([
@@ -69,6 +83,15 @@ def build_games(schedules):
 
 
 def build_play_stats(pbp):
+    """
+    Aggregate play-by-play into per-team-per-game offensive and defensive EPA stats
+
+    Filters applied (removes plays that shouldn't count toward "real" EPA):
+    - regular season only
+    - posteam/defteam/epa must be non-null
+    - play_type limited to pass/run (excludes penalties, kickoffs, etc.)
+    - excludes QB kneels, QB spikes, aborted plays, deleted plays
+    """
     plays = pbp.filter(
         (pl.col("season_type") == "REG") &
         pl.col("posteam").is_not_null() &
@@ -122,6 +145,10 @@ def build_play_stats(pbp):
 
 
 def build_team_games(games, team_stats):
+    """
+    Game-level table into one row per team per game (home + away),
+    attatch that team's offensive/defensive play stats for the game
+    """
     home = games.select([
         "game_id", "season", "week", "gameday",
         pl.col("home_team").alias("team"),
@@ -150,8 +177,8 @@ def build_team_games(games, team_stats):
 
     team_games = team_games.join(
         team_stats,
-        on=["game_id", "season", "week", "team"],
-        how="left"
+        on = ["game_id", "season", "week", "team"],
+        how = "left"
     )
 
     team_games = team_games.with_columns(
@@ -162,6 +189,9 @@ def build_team_games(games, team_stats):
 
 
 def check_team_game_joins(games, pbp, team_stats, team_games):
+    """
+    Diagnostics only, need to put behind a --debug flag
+    """
     print("\nChecking raw PBP for missing games:")
 
     missing_games = games.join(
@@ -282,6 +312,12 @@ def check_team_game_joins(games, pbp, team_stats, team_games):
 
 
 def add_pregame_features(team_games):
+    """
+    Compute leakage-safe PRE-GAME featuers:
+    - cumulative EPA/pace using only games strictly BEFORE the current one (via .shift(1) before the cumulative sum)
+
+    Look into adding season to the partition (.over(["team", "season"]))
+    """
     team_games = team_games.sort(["team", "gameday"])
 
     team_games = team_games.with_columns([
@@ -319,6 +355,10 @@ def add_pregame_features(team_games):
 
 
 def check_pregame_features(team_games):
+    """
+    More diagnostics; verifies why pregame features are null (no prior history vs. missing play stats)
+    Shows breakdwon by team/season
+    """
     missing = team_games.filter(
         pl.col("pregame_off_epa").is_null()
     )
@@ -366,6 +406,9 @@ def check_pregame_features(team_games):
 
 
 def check_dataset(team_games, games):
+    """
+    Structural QA: duplicate rows, impossible win/score combos, row counts
+    """
     print("\nChecking duplicate team-game rows:")
 
     duplicates = (
@@ -399,6 +442,8 @@ def check_dataset(team_games, games):
 
 
 def main():
+    args = parse_args
+
     schedules, pbp = load_data()
 
     print("\nBuilding games")
@@ -419,34 +464,36 @@ def main():
     print("\nBuilding team-game dataset")
     team_games = build_team_games(games, team_stats)
 
-    check_team_game_joins(games, pbp, team_stats, team_games)
+    if args.debug:
+        check_team_game_joins(games, pbp, team_stats, team_games)
 
     print("\nCalculating pregame features")
     team_games = team_games.filter(pl.col("off_epa").is_not_null())
     team_games = add_pregame_features(team_games)
 
-    check_pregame_features(team_games)
+    if args.debug:
+        check_pregame_features(team_games)
 
-    check_dataset(team_games, games)
+        check_dataset(team_games, games)
 
-    print("\nTeam-games missing play stats:")
+        print("\nTeam-games missing play stats:")
 
-    missing_stats = team_games.filter(
-        pl.col("off_epa").is_null()
-    )
+        missing_stats = team_games.filter(
+            pl.col("off_epa").is_null()
+        )
 
-    print(
-        missing_stats.select(["season", "week", "game_id", "team", "opponent"]).head(20)
-    )
+        print(
+            missing_stats.select(["season", "week", "game_id", "team", "opponent"]).head(20)
+        )
 
-    print(f"Team-games missing play stats: {len(missing_stats):,}")
+        print(f"Team-games missing play stats: {len(missing_stats):,}")
 
-    print("\nMissing play stats by season:")
-    print(
-        missing_stats.group_by("season")
-        .agg(pl.len().alias("missing"))
-        .sort("season")
-    )
+        print("\nMissing play stats by season:")
+        print(
+            missing_stats.group_by("season")
+            .agg(pl.len().alias("missing"))
+            .sort("season")
+        )
 
     print("\nSaving dataset")
 
